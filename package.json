@@ -1,0 +1,23 @@
+{
+  "name": "crdt-table",
+  "version": "1.0.0",
+  "description": "Conflict-free Collaborative 2-dimensional table",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js"
+  },
+  "keywords": [
+    "crdt",
+    "spreadsheet"
+  ],
+  "author": "Bartosz Sypytkowski <b.sypytkowski@gmail.com>",
+  "license": "GPL-3.0-or-later",
+  "devDependencies": {
+    "babel-jest": "^29.6.4",
+    "jest": "^29.6.4"
+  },
+  "dependencies": {
+    "murmurhash": "^2.0.1"
+  }
+}
