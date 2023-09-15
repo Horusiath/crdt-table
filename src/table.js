@@ -324,7 +324,7 @@ export class Table {
      * @param {number} count number of new columns to insert.
      */
     insertColumns(index, count = 1) {
-        let left = /** @type {FractionalKey} */ (index < this.colIndex.length-1 ? this.colIndex[index-1].key : MIN_SEQ)
+        let left = /** @type {FractionalKey} */ (index < this.colIndex.length ? this.colIndex[index-1].key : MIN_SEQ)
         const right = /** @type {FractionalKey} */ (index < this.colIndex.length ? this.colIndex[index].key : MAX_SEQ)
         /** @type {FractionalKey[]} */
         const columns =  []
@@ -455,6 +455,55 @@ export class Table {
         const update = { timestamp: this.incVersion(), deleteColumns: { columns } }
         this.apply(update) //TODO: optimization - don't thread local & remote updates the same way
         this.onUpdate(update)
+    }
+
+    /**
+     * Returns a piece of current table matching the boundaries set by a given selection.
+     * @param {Selection} selection 
+     * @returns {Row[]}
+     */
+    view(selection) {
+        const { upperLeft, lowerRight } = materializeSelection(this, selection)
+        const view = []
+        for (let i = upperLeft.row; i < lowerRight.row; i++) {
+            let row = this.body[i]
+            let res = []
+            for (let j = upperLeft.col; j < lowerRight.col; j++) {
+                res.push(row[j])
+            }
+            view.push(res)
+        }
+        return view
+    }
+
+    /**
+     * 
+     * @param {{row:number,col:number}} x 
+     * @param {{row:number,col:number}} y
+     * @returns {Selection}
+     */
+    select(x, y) {
+        const { upperLeft, lowerRight } = normalizeArea(x, y)
+        if (upperLeft.row < 0 || upperLeft.col < 0 || lowerRight.row >= this.rowIndex.length || lowerRight.col >= this.colIndex.length) {
+            throw new Error('selected area is outside of the bound of the table')
+        }
+        const corner1 = {
+            row: generateKey(this.hashId, 
+                upperLeft.row === 0 ? MIN_SEQ : this.rowIndex[upperLeft.row - 1].key,
+                upperLeft.row === this.rowIndex.length ? MAX_SEQ : this.rowIndex[upperLeft.row].key),
+            col: generateKey(this.hashId,
+                upperLeft.col === 0 ? MIN_SEQ : this.colIndex[upperLeft.col - 1].key,
+                upperLeft.col === this.colIndex.length ? MAX_SEQ : this.colIndex[upperLeft.col].key),
+        }
+        const corner2 = {
+            row: generateKey(this.hashId,
+                lowerRight.row === this.rowIndex.length ? MIN_SEQ : this.rowIndex[lowerRight.row].key,
+                lowerRight.row + 1 >= this.rowIndex.length ? MAX_SEQ : this.rowIndex[lowerRight.row + 1].key),
+            col: generateKey(this.hashId,
+                lowerRight.col === this.colIndex.length ? MIN_SEQ : this.colIndex[lowerRight.col].key,
+                lowerRight.col + 1 >= this.colIndex.length ? MAX_SEQ : this.colIndex[lowerRight.col + 1].key),
+        }
+        return new Selection(corner1, corner2)
     }
 }
 
@@ -630,4 +679,67 @@ const updateTombstone = (map, key, version) => {
     } else {
         map.splice(index, 0, new Entry(key, version))
     }
+}
+
+/**
+ * @typedef {{row:FractionalKey,col:FractionalKey,version:Version}} FractionalPosition
+ */
+
+/**
+ * Selection represents logical rectangual area within a Table. It maintains position while table structure is being changed.
+ */
+export class Selection {
+    /**
+     * @param {FractionalPosition} corner1 
+     * @param {FractionalPosition} corner2 
+     */
+    constructor(corner1, corner2) {
+        /** @type {FractionalPosition} */
+        this.corner1 = corner1
+        /** @type {FractionalPosition} */
+        this.corner2 = corner2
+    }
+}
+
+/**
+ * Materializes fractional position into pair of (row, column) indexes matching that position coordinates.
+ * 
+ * @param {Table} table 
+ * @param {FractionalPosition} pos 
+ * @returns {{row:number,col:number}}
+ */
+const materializePosition = (table, pos) => {
+    const row = binarySearch(table.rowIndex, pos.row, 0, table.rowIndex.length - 1)
+    const col = binarySearch(table.colIndex, pos.col, 0, table.colIndex.length - 1)
+    return { row: row.index, col: col.index }
+}
+
+/**
+ * @param {Table} table 
+ * @param {Selection} selection 
+ * @returns {{upperLeft:{row:number,col:number}, lowerRight:{row:number,col:number}}}
+ */
+const materializeSelection = (table, selection) => {
+    const x = materializePosition(table, selection.corner1)
+    const y = materializePosition(table, selection.corner2)
+    return normalizeArea(x, y)
+}
+
+/**
+ * 
+ * @param {{row:number,col:number}} x 
+ * @param {{row:number,col:number}} y 
+ * @returns {{upperLeft:{row:number,col:number}, lowerRight:{row:number,col:number}}}
+ */
+const normalizeArea = (x, y) => {
+    const upperLeft = {
+        row: Math.min(x.row, y.row),
+        col: Math.min(x.col, y.col)
+    }
+    const lowerRight = {
+        row: Math.max(x.row, y.row),
+        col: Math.max(x.col, y.col)
+    }
+    return { upperLeft, lowerRight }
+
 }
