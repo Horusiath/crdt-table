@@ -1,7 +1,14 @@
 import murmurhash  from 'murmurhash'
+import {FractionalIndex, Entry, isHigher, generateKey, MIN_SEQ, MAX_SEQ} from './seq.js'
 
 let latestClock = 0
 const CLOCK_MASK = ~((1 << 4) - 1)
+
+/**
+ * Key used by fractional index entries.
+ * @typedef {number[]} FractionalKey
+ */
+
 
 /**
  * Hybrid logical clock - gives a monotonically increasing timestamps.
@@ -14,24 +21,6 @@ export const hlc = () => {
     latestClock = Math.max(latestClock, curr)
     return ++latestClock
 }
-
-/**
- * Lamport clock used to mark changes.
- * @typedef {{timestamp:number,origin:string}} Version
- */
-
-/**
- * Key used by fractional index entries.
- * @typedef {number[]} FractionalKey
- */
-
-/**
- * Sorted map (ordered by FractionalKey within its entries).
- * Important property is that entries can be indexed with 0-based indexes.
- * 
- * @template T
- * @typedef {Entry<T>[]} FractionalMap<T>
- */
 
 /**
  * Alias for Row definition.
@@ -81,14 +70,14 @@ export class Table {
         this.hashId = murmurhash.v3(id)
         /** 
          * CRDT index for rows.
-         * @type {FractionalMap<null>} 
+         * @type {FractionalIndex<null>} 
          */
-        this.rowIndex = []
+        this.rowIndex = new FractionalIndex()
         /** 
          * CRDT index for columns.
-         * @type {FractionalMap<null>} 
+         * @type {FractionalIndex<null>} 
          */
-        this.colIndex = []        
+        this.colIndex = new FractionalIndex()
         /** 
          * User data in 2-dimensional table.
          * @type {Row[]} 
@@ -99,15 +88,6 @@ export class Table {
          * @type {(Version|null)[][]}
          */
         this.versions = []
-
-        /**
-         * Tombstones of removed rows and columns.
-         * @type {{rows: FractionalMap<Version>, columns: FractionalMap<Version>}}
-         */
-        this.tombstones = {
-            rows: [],   // fractional map of deleted rows
-            columns: [] // fractional map of deleted columns
-        }
 
         /**
          * Timestamp provider.
@@ -176,22 +156,23 @@ export class Table {
     applyUpsertColumns(columns, version) {
         const result = []
         for (let col of columns) {
-            let { index, found } = binarySearch(this.colIndex, col, 0, this.colIndex.length - 1)
-            if (!found) {
-                if (isTombstoned(this.tombstones.columns, col, version)) {
-                    // column was tombstoned and has higher version than current index, skip
-                    result.push(-1)
-                    continue
-                }
+            let f = this.colIndex.getIndexByKey(col)
+            if (f.tombstoned && isHigher(f.tombstoned, version)) {
+                // column was tombstoned and has higher version than current index, skip
+                result.push(-1)
+                continue
+            }
 
-                this.colIndex.splice(index, 0, new Entry(col, null))
+            if (!f.found) {
+                let index = f.index
+                this.colIndex.insert(index, col, null)
                 // adjust all existing rows
                 for (let i = 0; i < this.body.length; i++) {
                     this.body[i].splice(index, 0, null)
                     this.versions[i].splice(index, 0, null)
                 }
             }
-            result.push(index)
+            result.push(f.index)
         }
         return result
     }
@@ -205,22 +186,23 @@ export class Table {
     applyUpsertRows(columns, entries, version) {
         const columnIndexes = this.applyUpsertColumns(columns, version) // normalize columns
         for (let entry of entries) {
-            let { index, found } = binarySearch(this.rowIndex, entry.key, 0, this.rowIndex.length - 1)
+            let f = this.rowIndex.getIndexByKey(entry.key)
+            if (f.tombstoned && isHigher(f.tombstoned, version)) {
+                // this entry was already deleted with a higher timestamp
+                continue
+            }
             /** @type {Row} */
             let row 
             /** @type {Version[]} */
             let versions
-            if (found) {
+            if (f.found) {
                 // this.applyUpsertColumns already adjusted the number of columns in each row
-                row = this.body[index]
-                versions = this.versions[index]
+                row = this.body[f.index]
+                versions = this.versions[f.index]
             } else {
-                if (isTombstoned(this.tombstones.rows, entry.key, version)) {
-                    // this entry was already deleted with a higher timestamp
-                    continue
-                }
+                let index = f.index
                 // create a new 0-initialized rows
-                this.rowIndex.splice(index, 0, new Entry(entry.key, null))
+                this.rowIndex.insert(index, entry.key, null) //splice(index, 0, new Entry(entry.key, null))
                 row = new Array(this.colIndex.length).fill(null)
                 versions = new Array(this.colIndex.length).fill(null)
                 this.body.splice(index, 0, row)
@@ -250,11 +232,12 @@ export class Table {
      */
     applyDeleteRows(rows, version) {
         for (let key of rows) {
-            let index = indexOfKey(this.rowIndex, key)
-            if (index >= 0) {
+            let f = this.rowIndex.getIndexByKey(key)
+            if (f.found) {
+                let rowIndex = f.index
                 // check if there are entries with higher version that current delete timestamp
-                let row = this.body[index]
-                let versions = this.versions[index]
+                let row = this.body[rowIndex]
+                let versions = this.versions[rowIndex]
                 let keep = false
                 for (let i=0; i < row.length; i++) {
                     if (isHigher(version, versions[i])) {
@@ -268,15 +251,15 @@ export class Table {
                 }
 
                 if (!keep) {
-                    this.rowIndex.splice(index, 1)
-                    this.body.splice(index, 1)
-                    this.versions.splice(index, 1)
                     // add deleted row to tombstones
-                    updateTombstone(this.tombstones.rows, key, version)
+                    this.body.splice(rowIndex, 1)
+                    this.versions.splice(rowIndex, 1)
+                    // remove row from fractional map
+                    this.rowIndex.remove(rowIndex)
+                    this.rowIndex.tombstone(key, version)
                 }
             } else {
-                // check if we need to update tombstone
-                updateTombstone(this.tombstones.rows, key, version)
+                this.rowIndex.tombstone(key, version)
             }
         }
     }    
@@ -288,8 +271,9 @@ export class Table {
      */
     applyDeleteColumns(columns, version) {
         for (let key of columns) {
-            let colIndex = indexOfKey(this.colIndex, key)
-            if (colIndex >= 0) {
+            let f = this.colIndex.getIndexByKey(key)
+            if (f.found) {
+                let colIndex = f.index
                 let keep = false
                 for (let i = 0; i < this.body.length; i++) {
                     let versions = this.versions[i]
@@ -304,14 +288,17 @@ export class Table {
                     }
                 }
                 if (!keep) {
-                    this.colIndex.splice(colIndex, 1)
-                    updateTombstone(this.tombstones.columns, key, version)
-                    // adjust all existing rows
+                    // remove column from fractional map
+                    this.colIndex.remove(colIndex)
+                    this.colIndex.tombstone(key, version)
+                    // delete column on all existing rows
                     for (let i = 0; i < this.body.length; i++) {
                         this.body[i].splice(colIndex, 1)
                         this.versions[i].splice(colIndex, 1)
                     }
                 }
+            } else {
+                this.colIndex.tombstone(key, version)
             }
         }
     }    
@@ -324,8 +311,7 @@ export class Table {
      * @param {number} count number of new columns to insert.
      */
     insertColumns(index, count = 1) {
-        let left = /** @type {FractionalKey} */ (index < this.colIndex.length ? this.colIndex[index-1].key : MIN_SEQ)
-        const right = /** @type {FractionalKey} */ (index < this.colIndex.length ? this.colIndex[index].key : MAX_SEQ)
+        let { left, right } = this.colIndex.neighbors(index)
         /** @type {FractionalKey[]} */
         const columns =  []
         for (let i = 0; i < count; i++) {
@@ -347,19 +333,8 @@ export class Table {
         /** @type {Entry<any>[]} */
         const rows = []
         // check if we don't need to add new columns to accomodate incoming row cells
-        const columns = this.colIndex.map(c => c.key)
-        let maxRowLength = 0
-        for (let value of values) {
-            maxRowLength = Math.max(maxRowLength, value.length)
-        }
-        for (let col = columns.length; col < maxRowLength; col++) {
-            // if row has more columns than current known columns length, we need to add more columns
-            const lastColumn = /** @type {FractionalKey} */ (columns.length > 0 ? columns[col-1] : MIN_SEQ)
-            const columnKey = generateKey(this.hashId, lastColumn, /** @type {FractionalKey} */ MAX_SEQ)
-            columns.push(columnKey)
-        }
-        let left = /** @type {FractionalKey} */ (index > 0 ? this.rowIndex[index-1].key : MIN_SEQ)
-        const right = /** @type {FractionalKey} */ (index < this.rowIndex.length ? this.rowIndex[index].key : MAX_SEQ)
+        const columns = this.adjustColumns(0, values)
+        let { left, right } = this.rowIndex.neighbors(index)
         for (let value of values) {
             const rowKey = generateKey(this.hashId, left, right)
             const entry = new Entry(rowKey, value)
@@ -367,10 +342,36 @@ export class Table {
             left = rowKey;
         }
         const update = { timestamp: this.incVersion(), upsertRows: { columns, rows } }
-        this.apply(update) //TODO: optimization - don't thread local & remote updates the same way
+        this.apply(update) //TODO: optimization - don't threat local & remote updates the same way
         this.onUpdate(update)
     }
     
+    /**
+     * @private 
+     * @param {number} start 
+     * @param {Row[]} rows 
+     * @returns {FractionalKey[]}
+     */
+    adjustColumns(start, rows) {
+        /** @type {FractionalKey[]} */
+        const columns = []
+        let i = start
+        let left = /** @type {FractionalKey} */ (MIN_SEQ)
+        for (let row of rows) {
+            for (; i < start + row.length; i++) {
+                if (i < this.colIndex.length) {
+                    left = this.colIndex.entries[i].key
+                    columns.push(left)
+                } else {
+                    let key = generateKey(this.hashId, left, MAX_SEQ)
+                    columns.push(key)
+                    left = key
+                }
+            }
+        }
+        return columns
+    }
+
     /**
      * Upserts block of cells in determined by selection range starting at a given `row` index and `col` index.
      * This method will update values of existing rows found at that following indexes, or insert new rows if
@@ -381,32 +382,16 @@ export class Table {
      * @param {Row[]} values cells of the corresponding rows to be updated. 
      */
     updateCells(row, col, values) {
-        // first let's calculate affected columns - possibly a new ones may have to be introduced
-        /** @type {FractionalKey[]} */
-        const columns = []
-        let maxRowLength = 0
-        for (let value of values) {
-            maxRowLength = Math.max(maxRowLength, value.length)
-        }
-        for (let i = 0; i < maxRowLength; i++) {
-            let curr = i + col
-            if (curr < this.colIndex.length) {
-                columns.push(this.colIndex[curr].key)
-            } else {
-                // if row has more columns than current known columns length, we need to add more columns
-                const lastColumn = /** @type {FractionalKey} */ (columns.length > 0 ? columns[columns.length-1] : MIN_SEQ)
-                const columnKey = generateKey(this.hashId, lastColumn, /** @type {FractionalKey} */ MAX_SEQ)
-                columns.push(columnKey)
-            }
-        }
+        // check if we don't need to add new columns to accomodate incoming row cells
+        const columns = this.adjustColumns(col, values)
         const rows = []
         let i = row
-        let lastRow = /** @type {FractionalKey} */ (this.rowIndex.length > 0 ? this.rowIndex[this.rowIndex.length-1].key : MIN_SEQ)
+        let lastRow = this.rowIndex.lastKey
         for (let value of values) {
             /** @type {Entry<any>} */
             let entry
             if (i < this.rowIndex.length) {
-                entry = new Entry(this.rowIndex[i].key, value)
+                entry = new Entry(this.rowIndex.entries[i].key, value)
             } else {
                 let rowKey = generateKey(this.hashId, lastRow, /** @type {FractionalKey} */ MAX_SEQ)
                 entry = new Entry(rowKey, value)
@@ -432,7 +417,7 @@ export class Table {
         const rows = []
         const end = Math.min(this.rowIndex.length, index + length)
         for (let i = index; i < end; i++) {
-            const row = this.rowIndex[i].key
+            const row = this.rowIndex.entries[i].key
             rows.push(row)
         }
         const update = { timestamp: this.incVersion(), deleteRows: { rows } }
@@ -449,7 +434,7 @@ export class Table {
         const columns = []
         const end = Math.min(this.colIndex.length, index + length)
         for (let i = index; i < end; i++) {
-            const col = this.colIndex[i].key
+            const col = this.colIndex.entries[i].key
             columns.push(col)
         }
         const update = { timestamp: this.incVersion(), deleteColumns: { columns } }
@@ -489,195 +474,21 @@ export class Table {
         }
         const corner1 = {
             row: generateKey(this.hashId, 
-                upperLeft.row === 0 ? MIN_SEQ : this.rowIndex[upperLeft.row - 1].key,
-                upperLeft.row === this.rowIndex.length ? MAX_SEQ : this.rowIndex[upperLeft.row].key),
+                upperLeft.row === 0 ? MIN_SEQ : this.rowIndex.entries[upperLeft.row - 1].key,
+                upperLeft.row === this.rowIndex.length ? MAX_SEQ : this.rowIndex.entries[upperLeft.row].key),
             col: generateKey(this.hashId,
-                upperLeft.col === 0 ? MIN_SEQ : this.colIndex[upperLeft.col - 1].key,
-                upperLeft.col === this.colIndex.length ? MAX_SEQ : this.colIndex[upperLeft.col].key),
+                upperLeft.col === 0 ? MIN_SEQ : this.colIndex.entries[upperLeft.col - 1].key,
+                upperLeft.col === this.colIndex.length ? MAX_SEQ : this.colIndex.entries[upperLeft.col].key),
         }
         const corner2 = {
             row: generateKey(this.hashId,
-                lowerRight.row === this.rowIndex.length ? MIN_SEQ : this.rowIndex[lowerRight.row].key,
-                lowerRight.row + 1 >= this.rowIndex.length ? MAX_SEQ : this.rowIndex[lowerRight.row + 1].key),
+                lowerRight.row === this.rowIndex.length ? MIN_SEQ : this.rowIndex.entries[lowerRight.row].key,
+                lowerRight.row + 1 >= this.rowIndex.length ? MAX_SEQ : this.rowIndex.entries[lowerRight.row + 1].key),
             col: generateKey(this.hashId,
-                lowerRight.col === this.colIndex.length ? MIN_SEQ : this.colIndex[lowerRight.col].key,
-                lowerRight.col + 1 >= this.colIndex.length ? MAX_SEQ : this.colIndex[lowerRight.col + 1].key),
+                lowerRight.col === this.colIndex.length ? MIN_SEQ : this.colIndex.entries[lowerRight.col].key,
+                lowerRight.col + 1 >= this.colIndex.length ? MAX_SEQ : this.colIndex.entries[lowerRight.col + 1].key),
         }
         return new Selection(corner1, corner2)
-    }
-}
-
-const MIN_INT = 0n
-const MAX_INT = BigInt(Number.MAX_SAFE_INTEGER)
-const MASK = ~((1n << 32n) - 1n)
-const MIN_SEQ = [MIN_INT]
-const MAX_SEQ = [MAX_INT]
-
-/**
- * Logical position identifier of LSeq.
- * 
- * @template T
- */
-export class Entry {
-    /**
-     * 
-     * @param {FractionalKey} key
-     * @param {T} value
-     */
-    constructor(key, value) {
-        /** @type {FractionalKey} */
-        this.key = key
-        /** @type {T} */
-        this.value = value
-    }
-
-    /**
-     * @param {T} newValue 
-     * @returns {Entry<T>}
-     */
-    copy(newValue) {
-        return new Entry(key, newValue)
-    }
-}
-
-/**
- * 
- * @param {FractionalKey} a
- * @param {FractionalKey} b
- * @returns {number}
- */
-export const compareKeys = (a, b) => {
-    // compare sequences
-    let i = 0
-    for (; i < a.length && i < b.length; i++) {
-        const x = a[i] - b[i]
-        if (x !== 0) {
-            return x
-        }
-    }
-    return a.length - b.length
-}
-
-/**
- * Find insert index for a given key.
- * 
- * @param {FractionalMap<T>} map 
- * @param {FractionalKey} key 
- * @param {number} start 
- * @param {number} end 
- * @returns {{index:number,found:bool}}
- */
-const binarySearch = (map, key, start, end) => {
-    while (start <= end) {
-        let m = (start + end) >> 1
-        let cmp = compareKeys(map[m].key, key)
-        if (cmp === 0) {
-            return { index: m, found: true }
-        } else if (cmp < 0) {
-            start = m + 1
-        } else {
-            end = m - 1
-        }
-    }
-    return { index: end + 1, found: false }
-}
-    
-/**
- * @param {FractionalMap<T>} map 
- * @param {FractionalKey} key
- * @returns {number}
- */
-const indexOfKey = (map, key) => {
-    const { index, found } = binarySearch(map, key, 0, map.length - 1)
-    return found ? index : -1
-}
-
-/**
- * Generates a new unique sequence, that lexically fits between left (lower) and right (higher) sequence.
- * 
- * The generated number is a series of steps. Each step is a 53bit integer (`Number.MAX_SAFE_INTEGER`),
- * where the lower 32-bit is a Murmur3 hash of clientID that produced this step, while upper 21 bits is 
- * sequence to be generated between the left's and right's number at the same depth.
- * 
- * 
- * @param {number} hash MurMur v3 hash of client's ID.
- * @param {FractionalKey|null} left left neighbor key (lower value in lexical sense)
- * @param {FractionalKey|null} right right neighbor key (higher value in lexical sense)
- * @returns {FractionalKey}
- */
-export const generateKey = (hash, left, right) => {
-    const h = BigInt(hash)
-    const lo = left || []
-    const hi = right || []
-    const result = []
-    let depth = 0
-    for (;; depth++) {
-        let x = BigInt(depth < lo.length ? lo[depth] : (MIN_INT|h))
-        let y = BigInt(depth < hi.length ? hi[depth] : MAX_INT)
-        if (x === y) {
-            result.push(Number(x))
-        } else if ((x >> 32n) + 1n >= (y >> 32n)) {
-            // continue
-            let n = Number(x)
-            result.push(n)
-        } else {
-            // there's a spare space between hi and lo at current position
-            // use it and return
-            let n = Number(((x + (1n << 32n)) & MASK) | h)
-            result.push(n)
-            break;
-        }
-    }
-    return result
-}
-
-/**
- * Checks if `left` version is higher than `right` one.
- * @param {Version|null} left 
- * @param {Version|null} right 
- * @returns {boolean}
- */
-export const isHigher = (left, right) => {
-    if (left === null) {
-        return false
-    }
-    if (right === null) {
-        return true
-    }
-
-    if (left.timestamp > right.timestamp) {
-        return true
-    } else if (left.timestamp === right.timestamp) {
-        return left.origin > right.origin
-    }
-}
-
-/**
- * @param {FractionalMap<Version>} map 
- * @param {FractionalKey} key 
- * @param {Version} version 
- * @returns {boolean}
- */
-const isTombstoned = (map, key, version) => {
-    let { index, found } = binarySearch(map, key, 0, map.length - 1)
-    return found && isHigher(map[index].value, version)
-}
-
-/**
- * 
- * @param {FractionalMap<Version>} map 
- * @param {FractionalKey} key 
- * @param {Version} version 
- */
-const updateTombstone = (map, key, version) => {
-    const { index, found } = binarySearch(map, key, 0, map.length - 1)
-    if (found) {
-        const entry = map[index]
-        if (isHigher(version, entry.value)) {
-            entry.value = version
-        }
-    } else {
-        map.splice(index, 0, new Entry(key, version))
     }
 }
 
@@ -709,8 +520,8 @@ export class Selection {
  * @returns {{row:number,col:number}}
  */
 const materializePosition = (table, pos) => {
-    const row = binarySearch(table.rowIndex, pos.row, 0, table.rowIndex.length - 1)
-    const col = binarySearch(table.colIndex, pos.col, 0, table.colIndex.length - 1)
+    const row = table.rowIndex.getIndexByKey(pos.row)
+    const col = table.colIndex.getIndexByKey(pos.col)
     return { row: row.index, col: col.index }
 }
 
